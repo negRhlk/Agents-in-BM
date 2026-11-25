@@ -1,0 +1,14 @@
+# local environment / tooling
+.venv/
+.codex/
+__pycache__/
+*.pyc
+
+# upstream BMSim is fetched by setup_bmsim.sh, not redistributed here
+vendor/
+
+# simulation outputs
+mesh_agents/runs/
+*.log
+topology.png
+server.db

@@ -1,0 +1,6 @@
+spade==4.1.4
+spade_bdi==0.3.3
+greenlet  # needed by SPADE's embedded XMPP server, not pulled in automatically
+networkx<3  # BMSim calls nx.info(), removed in networkx 3
+numpy
+matplotlib

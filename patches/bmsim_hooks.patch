@@ -1,0 +1,173 @@
+Integration hooks for BMSim (https://github.com/BMSimulator/BMSim, commit 7c6af2a).
+
+BMSim is (c) Zohreh Hosseinkhani and Majid Nabi. This patch modifies their code and
+is used with the authors' knowledge; BMSim itself is not redistributed here.
+If you use BMSim, please cite:
+  Z. Hosseinkhani and M. Nabi, "BMSim: An Event-Driven Simulator for Performance
+  Evaluation of Bluetooth Mesh Networks", IEEE Internet of Things Journal, 2023.
+
+Apply with ./setup_bmsim.sh (or: git -C vendor/BMSim apply ../../patches/bmsim_hooks.patch)
+
+diff --git a/codes/app_layer.py b/codes/app_layer.py
+new file mode 100644
+index 0000000..e6f7bdb
+--- /dev/null
++++ b/codes/app_layer.py
+@@ -0,0 +1,26 @@
++"""Application-layer hooks for BMSim (added for the SPADE-BDI integration test).
++
++BMSim's original behaviour is preserved when nothing overrides these hooks:
++every generator node sends a random integer to the sink at every generation slot.
++
++An external controller (e.g. a multi-agent bridge) can, *before* importing
++`event_driven`, set:
++
++  SCENARIO     dict overriding the deployment / node roles (see initializer.py)
++  on_generate  callable(node_id, sim_time_ms, destination, data, ttl)
++                 -> (destination_list, data, ttl)   to send a packet in this slot
++                 -> None                            to skip this generation slot
++  on_deliver   callable(node_id, message, sim_time_ms)
++                 called when a data packet (not heartbeat / friend poll)
++                 reaches one of its destination nodes.
++"""
++
++SCENARIO = None
++
++
++def on_generate(node_id, sim_time, destination, data, ttl):
++    return destination, data, ttl
++
++
++def on_deliver(node_id, msg, sim_time):
++    pass
+diff --git a/codes/event_driven.py b/codes/event_driven.py
+index 724c235..322f3cc 100644
+--- a/codes/event_driven.py
++++ b/codes/event_driven.py
+@@ -30,6 +30,7 @@ from scan39 import Scan_function39
+ from initializer import *
+ from Network_Updater import *
+ from destinations import F_destination
++import app_layer
+ 
+ ##########################################################################
+ while True:  # events are executed in order of their time
+@@ -119,6 +120,15 @@ while True:  # events are executed in order of their time
+         if nodes[i_node].n_count == 0:  # first transmission
+             # in this function, the node's destinations and TTL are determined
+             destination1, data, TTL = F_destination(NUMBER_NODES, Center_node, nodes[i_node].node_TTL)
++            # [SPADE-BDI integration] the application layer decides what to send in this slot
++            _app = app_layer.on_generate(i_node, Time, destination1, data, TTL)
++            if _app is None:  # nothing to send: skip the slot, no airtime, go straight to next-event selection
++                nodes[i_node].last_generation_time = all_event[i_node][NODE_TIME]
++                all_event[i_node][NODE_EVENT] = AD39_EVENT_End
++                i_node = all_event.index(min((x for x in all_event), key=lambda k: k[0]))
++                Time = all_event[i_node][NODE_TIME]
++                continue
++            destination1, data, TTL = _app
+             message_generation = message(TTL, i_node, destination1, data)  # creating the main message
+             nodes[i_node].Gen_cache.append(message_generation)  # the packet is appended to the generation cache 
+             nodes[i_node].message = copy.deepcopy(nodes[i_node].Gen_cache[0])
+diff --git a/codes/initializer.py b/codes/initializer.py
+index aa7d7a5..bf8c99e 100644
+--- a/codes/initializer.py
++++ b/codes/initializer.py
+@@ -54,6 +54,18 @@ NUMBER_RELAY_NODE = int(1/3*NUMBER_NODES)  # number of nodes with relay feature
+ NUMBER_RELAY_G_NODE = int(1/6*NUMBER_NODES)  # number of nodes with relay and generator features in the network
+ NODE_RANGE = 11.26  # the communication range of the nodes, assumin a unit disk model
+ EXECUTION_TIME = 10000  # the execution time of the simulator in milliseconds
++############ [SPADE-BDI integration] external scenario override ############
++import app_layer
++_SC = app_layer.SCENARIO
++if _SC is not None:
++    NUMBER_NODES = len(_SC["positions"])
++    x = [p[0] for p in _SC["positions"]]
++    y = [p[1] for p in _SC["positions"]]
++    NODE_RANGE = _SC.get("node_range", NODE_RANGE)
++    EXECUTION_TIME = _SC.get("execution_time", EXECUTION_TIME)
++    NUMBER_RELAY_NODE = int(1/3*NUMBER_NODES)
++    NUMBER_RELAY_G_NODE = int(1/6*NUMBER_NODES)
++############################################################################
+ #####loging##
+ """when TOTAL_LOG is one, each node has a separate log file
+  with detailed data about its operations during network simulation. 
+@@ -194,6 +206,19 @@ for i_f in range(NUMBER_NODES):
+ for i_heart in range(NUMBER_NODES):
+     nodes[i_heart].Heartbeat_period = 0
+ nodes[Center_node].Heartbeat_period = 4000
++############ [SPADE-BDI integration] explicit node roles ############
++if _SC is not None:
++    Center_node = _SC.get("sink", Center_node)
++    Center_node_static = Center_node
++    for _i in range(NUMBER_NODES):
++        nodes[_i].Heartbeat_period = 0
++    nodes[Center_node].Heartbeat_period = _SC.get("heartbeat_period", 4000)
++    for _i, _feat in _SC.get("features", {}).items():
++        nodes[_i].feature = _feat
++    for _i, _gi in _SC.get("generation_interval", {}).items():
++        nodes[_i].GENERATION_INTERVAL = _gi
++        nodes[_i].last_generation_time = random.randint(0, _gi)
++######################################################################
+ ############# choose a static model for reception_ratio ##############
+ reception_ratio = [[100 for x in range(NUMBER_NODES)] for y in range(NUMBER_NODES)]
+ #############constants##############
+diff --git a/codes/scan37.py b/codes/scan37.py
+index 48b3dbb..3ba4342 100644
+--- a/codes/scan37.py
++++ b/codes/scan37.py
+@@ -6,6 +6,7 @@
+  the first condition is checked, whether the simulator's current time is increased up to the scan window or not 
+ """ 
+ from initializer import *
++import app_layer
+ import random
+ def Scan_function37(nodes, i, all_event, NODE_TIME, NODE_EVENT, reception_ratio, logger, Time):
+     if Time < nodes[i].first_time_scan + nodes[i].SCAN_WINDOW:  # this is true until the end of the scan window
+@@ -141,6 +142,7 @@ def Scan_function37(nodes, i, all_event, NODE_TIME, NODE_EVENT, reception_ratio,
+                                            nodes[i].buffer[len(nodes[i].buffer) - 1].source, nodes[i].ID,
+                                            round(Time, 2), nodes[i].buffer[len(nodes[i].buffer) - 1].seq_number,
+                                            round(nodes[i].buffer[len(nodes[i].buffer) - 1].generation_time, 2))
++                            app_layer.on_deliver(nodes[i].ID, nodes[i].buffer[len(nodes[i].buffer) - 1], Time)  # [SPADE-BDI integration]
+                         # adjusting some settings related to friend nodes 
+                         if ((nodes[i].feature == FRIEND_NODE or nodes[i].feature == FRIEND_RELAY_NODE) and
+                                 nodes[i].buffer[len(nodes[i].buffer) - 1].friend_poll == 1):
+diff --git a/codes/scan38.py b/codes/scan38.py
+index 04c3665..1cab99d 100644
+--- a/codes/scan38.py
++++ b/codes/scan38.py
+@@ -4,6 +4,7 @@
+  for giving more freedom to the developer in future development we preferred to write them in the separate functions 
+ """
+ from initializer import *
++import app_layer
+ import random 
+ def Scan_function38(nodes, i, all_event, NODE_TIME, NODE_EVENT, reception_ratio, logger, Time):
+     if Time < nodes[i].first_time_scan+nodes[i].SCAN_WINDOW:
+@@ -115,6 +116,7 @@ def Scan_function38(nodes, i, all_event, NODE_TIME, NODE_EVENT, reception_ratio,
+                                                      nodes[i].ID, round(Time, 2),
+                                               nodes[i].buffer[len(nodes[i].buffer)-1].seq_number,
+                                                      round(nodes[i].buffer[len(nodes[i].buffer)-1].generation_time, 2))
++                                  app_layer.on_deliver(nodes[i].ID, nodes[i].buffer[len(nodes[i].buffer) - 1], Time)  # [SPADE-BDI integration]
+ 
+                               if (nodes[i].feature == FRIEND_NODE or nodes[i].feature == FRIEND_RELAY_NODE) and\
+                                       nodes[i].buffer[len(nodes[i].buffer)-1].friend_poll == 1:
+diff --git a/codes/scan39.py b/codes/scan39.py
+index c3b33d0..a40b3ab 100644
+--- a/codes/scan39.py
++++ b/codes/scan39.py
+@@ -4,6 +4,7 @@
+ for giving more freedom to the developer in future development we preferred to write them in the separate functions 
+ """
+ from initializer import *
++import app_layer
+ import random
+ def Scan_function39(nodes, i, all_event, NODE_TIME, NODE_EVENT, reception_ratio, logger, Time):
+     if Time < nodes[i].first_time_scan+nodes[i].SCAN_WINDOW:
+@@ -115,6 +116,7 @@ def Scan_function39(nodes, i, all_event, NODE_TIME, NODE_EVENT, reception_ratio,
+                                               nodes[i].buffer[len(nodes[i].buffer)-1].source, nodes[i].ID,
+                                               round(Time, 2), nodes[i].buffer[len(nodes[i].buffer)-1].seq_number,
+                                               round(nodes[i].buffer[len(nodes[i].buffer)-1].generation_time, 2))
++                                  app_layer.on_deliver(nodes[i].ID, nodes[i].buffer[len(nodes[i].buffer) - 1], Time)  # [SPADE-BDI integration]
+                               if (nodes[i].feature == FRIEND_NODE or nodes[i].feature == FRIEND_RELAY_NODE) and\
+                                       nodes[i].buffer[len(nodes[i].buffer)-1].friend_poll == 1:
+                                   nodes[i].response_friend_time = all_event[i][NODE_TIME]+Receive_Delay +\
